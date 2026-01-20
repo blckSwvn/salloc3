@@ -4,11 +4,11 @@
 
 int main(){
 	char *ptr = salloc(16);
-	sfree(ptr);
+	// sfree(ptr);
 	char *ptr2 = salloc(16);
-	sfree(ptr2);
+	// sfree(ptr2);
 	char *ptr3 = salloc(16);
-	sfree(ptr3);
+	// sfree(ptr3);
 	printf("%p\n%p\n%p\n",ptr,ptr2,ptr3);
 
 

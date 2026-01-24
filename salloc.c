@@ -1,6 +1,6 @@
 #include <stdalign.h>
+#include <stddef.h>
 #include <stdint.h>
-#include <string.h>
 #include <stdlib.h>
 #include <sys/mman.h>
 #include <threads.h>
@@ -11,9 +11,10 @@
 
 #define DEBUG
 
-#define BINS 128
-#define MAX_SIZE 2048
-#define SLAB_SIZE 4096
+#define SIZE_JUMPS 16 //16 by default
+#define MAX_SIZE 2048 //2048 by default
+#define SLAB_SIZE 4096 //4096 should not be changed
+#define BINS SLAB_SIZE - MAX_SIZE / SIZE_JUMPS //128 by default
 
 struct block_header {
 	struct block_header *next;
@@ -32,7 +33,14 @@ struct page_header {
 thread_local uint8_t thread_owner;
 thread_local struct page_header *freelist[BINS] = {NULL};
 
+_Atomic uint8_t config[BINS] = {5};
+_Atomic uint8_t freelist_len[BINS] = {0};
 _Atomic (struct page_header*)global[BINS] = {NULL};
+
+inline void salloc_config(uint8_t len_target, uint8_t bin_index){
+	atomic_store(&config[bin_index], len_target);
+}
+
 
 static inline struct page_header *get_header(void *ptr){
 	uintptr_t header = (uintptr_t)ptr;
@@ -40,9 +48,11 @@ static inline struct page_header *get_header(void *ptr){
 	return (void *)header;
 }
 
+
 static inline size_t align(size_t len){
-	return (len + 15) & ~((size_t)15);
+	return (len + (SIZE_JUMPS-1)) & ~((size_t)(SIZE_JUMPS-1));
 }
+
 
 static inline void insert_page_to(struct page_header *header, struct page_header **head){
 	header->prev = NULL;
@@ -51,16 +61,19 @@ static inline void insert_page_to(struct page_header *header, struct page_header
 	*head = header;
 }
 
+
 static inline void rm_page_from(struct page_header *header, struct page_header **head){
 	if(header->prev)header->prev->next = header->next;
 	if(header->next)header->next->prev = header->prev;
 	if(*head == header)*head = header->next;
 }
 
+
 static inline void insert_to_head(struct block_header *ptr, struct page_header *header){
 	ptr->next = header->head;
 	header->head = ptr;
 }
+
 
 void populate(struct page_header *new, uint32_t size){
 	struct block_header *block = (struct block_header *)((char *)new + sizeof(struct page_header) + size); //skips first block to avoid pop_from_head for first allocation
@@ -78,6 +91,27 @@ void populate(struct page_header *new, uint32_t size){
 	insert_page_to(new, &freelist[new->size_index]);
 }
 
+
+void cleanup_list(uint32_t i){
+	struct page_header *curr = atomic_load_explicit(&global[i], memory_order_acquire);
+	if(!curr)return;
+	struct page_header *last = curr;
+	for(uint32_t y = 0; y < config[i]; i++){
+		if(!curr)break;
+		last = curr;
+		curr = curr->next;
+	}
+	last->next = NULL;
+
+	struct page_header *next;
+	while(curr){
+		next = curr->next;
+		munmap(curr, SLAB_SIZE);
+		curr = next;
+	}
+}
+
+
 void *salloc(size_t len){
 	len = align(len);
 	if(len > MAX_SIZE){
@@ -88,7 +122,7 @@ void *salloc(size_t len){
 		new->size_index = len;
 		return (void *)((char *)new + sizeof(struct page_header));
 	}
-	size_t i = (len/16)-1;
+	size_t i = (len/SIZE_JUMPS)-1;
 	if(freelist[i]){
 		if(freelist[i]->head){
 #ifdef DEBUG
@@ -127,6 +161,7 @@ void *salloc(size_t len){
 				if(!old_head)break;
 				new_head = old_head->next;
 			}while(!atomic_compare_exchange_weak_explicit(&global[i], &old_head, new_head, memory_order_acquire, memory_order_relaxed));
+			atomic_fetch_sub(&global[i], 1);
 			old_head->owner = &thread_owner;
 			old_head->blocks_used = 0;
 			insert_page_to(old_head, &freelist[i]);
@@ -152,6 +187,7 @@ void *salloc(size_t len){
 
 	return NULL;
 }
+
 
 void sfree(void *ptr){
 	struct page_header *header = get_header(ptr);
@@ -197,7 +233,31 @@ void sfree(void *ptr){
 			if(!old_head)break;
 			header->next = old_head;
 		}while(!atomic_compare_exchange_weak_explicit(&global[header->size_index], &old_head, header, memory_order_release, memory_order_relaxed));
+		uint8_t len = atomic_fetch_add(&freelist_len[header->size_index],1) +1;
+		if(len > 2*config[header->size_index])cleanup_list(header->size_index);
 		return;
 	}
 	return;
+}
+
+
+void *srealloc(void *ptr, size_t len){
+	align(len);
+	struct page_header *header = get_header(ptr);
+	size_t size = (header->size_index+1)*16;
+	if(len<=size)return ptr;
+	void *new = salloc(len);
+	if(!new)return NULL;
+	memcpy(new, ptr, size);
+	sfree(ptr);
+	return new;
+}
+
+
+void *scalloc(size_t amount, size_t len){
+	size_t size = align(amount*len);
+	void *ptr = salloc(size);
+	if(!ptr)return NULL;
+	memset(ptr, 0, size);
+	return ptr;
 }
